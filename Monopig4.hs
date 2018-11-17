@@ -443,7 +443,7 @@ fillMemory = dup <> dup <> puti 0 <>
              pop <> pop
 
 fill :: Program' IO a
-fill = dup <> puti 0 <>
+fill = dup <> dup <> puti 0 <>
        while (dup <> push memSize <> geti 0 <> sub <> lt)
        (geti 0 <> add <> dup <> push 1 <> swap <> put) <>
        pop
@@ -451,6 +451,6 @@ fill = dup <> puti 0 <>
 sieve :: Program' IO a
 sieve = push 2 <>
         while (dup <> dup <> mul <> push memSize <> lt)
-        (fill <> geti 0 <> inc)
+        (dup <> get <> branch mempty fill <> inc)
 
 main = execM (sieve <> prtS "Ok")

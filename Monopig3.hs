@@ -1,6 +1,6 @@
 {-# LANGUAGE LambdaCase, GeneralizedNewtypeDeriving, TupleSections,BangPatterns  #-}
 
-module Monopig3 where
+module Main where
 
 import Data.Semigroup (Max(..),stimes, Semigroup(..))
 import Data.Monoid hiding ((<>))
@@ -21,7 +21,7 @@ data VM a = VM { stack :: !Stack
                , journal :: a }
             deriving Show
 
-memSize = 4
+memSize = 650
 mkVM = VM mempty mempty (V.replicate memSize 0)
 
 setStack  x (VM _ st m l) = VM x st m l
@@ -379,5 +379,6 @@ test = push 8 <>
        dup <> fact3 <> swap <>
        push 54 <> gcd1 <>
        dup <> push 20 <> pow
+
        
---main = print $ stack $ exec (stimes 10000 test)
+main = print $ stack $ exec sieve

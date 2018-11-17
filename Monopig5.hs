@@ -4,37 +4,33 @@ module Main where
 
 import Data.Monoid hiding ((<>))
 import Data.Semigroup (Semigroup(..),stimes,Max(..))
-import Data.Vector.Unboxed ((//),(!),Vector,toList)
-import qualified Data.Vector.Unboxed as V (replicate)
-import Data.List.Split
-import Data.List (inits, tails, intercalate)
 import Control.Monad
+import Control.Monad.Primitive
 import Control.Monad.Identity
+import qualified Data.Vector.Unboxed as V
+import qualified Data.Vector.Unboxed.Mutable as M
 
 type Stack = [Int]
-type Memory = Vector Int
 
-memSize = 65000 :: Int
+memSize = 65000
 
 data VM a = VM { stack :: Stack
                , status :: Maybe String
-               , memory :: Memory
                , journal :: a }
---            deriving Show
+            deriving Show
 
-mkVM = VM mempty mempty (V.replicate memSize 0)
+mkVM = VM mempty mempty
 
-setStack  x (VM _ st m l) = return $ VM x st m l
-setStatus st (VM s _ m l) = return $ VM s st m l
-setMemory m (VM s st _ l) = return $ VM s st m l
-addRecord x (VM s st m l) = VM s st m (x<>l)
+setStack  x (VM _ st l) = return $ VM x st l
+setStatus st (VM s _ l) = return $ VM s st l
+addRecord x (VM s st l) = return $ VM s st (x<>l)
 
 ------------------------------------------------------------
 
 data Code = IF [Code] [Code]
           | REP [Code]
           | WHILE [Code] [Code]
-          | PUT | GET | PUTI Int | GETI Int
+          | PUTI Int | GETI Int | PUT | GET
           | PUSH Int | POP | DUP | SWAP | EXCH
           | INC | DEC | NEG
           | ADD | MUL | SUB | DIV | MOD
@@ -42,6 +38,8 @@ data Code = IF [Code] [Code]
           | ASK | PRT | PRTS String
           | FORK [Code] [Code]
           deriving (Read, Show, Eq)
+
+------------------------------------------------------------
 
 newtype ActionM m a = ActionM {runActionM :: a -> m a}
 
@@ -52,60 +50,69 @@ instance Monad m => Monoid (ActionM m a) where
   ActionM f `mappend` ActionM g = ActionM (f >=> g)
   mempty = ActionM return
 
+------------------------------------------------------------
+
 newtype Program m a = Program { getProgram :: ([Code], ActionM m (VM a)) }
   deriving (Semigroup, Monoid)
 
-type Program' m a = (Code -> VM a -> m (VM a)) -> Program m a
-type Pure a = Program' Identity a
+type Memory m = M.MVector (PrimState m) Int
+type Logger m a = Memory m  -> Code -> VM a -> m (VM a)
+type Program' m a = Logger m a -> Memory m -> Program m a
 
-program c f p = Program . ([c],) . ActionM $
-  \vm -> p c =<< f (stack vm) vm
-  -- \vm -> case status vm of
-  --   Nothing -> p c =<< f (stack vm) vm
-  --   m -> return vm
+program c f p v = Program . ([c],) . ActionM $
+  \vm -> case status vm of
+    Nothing -> p v c =<< f (stack vm) vm
+    m -> return vm
 
-programM c f p = Program . ([c],) . ActionM $
-  \vm -> p c =<< f (memory vm, stack vm) vm
-  -- \vm -> case status vm of
-  --   Nothing -> p c =<< f (memory vm, stack vm) vm
-  --   m -> return vm
+programM c f p v = Program . ([c],) . ActionM $
+  \vm -> case status vm of
+    Nothing -> p v c =<< f v (stack vm) vm
+    m -> return vm
 
 run :: Monad m => Program m a -> VM a -> m (VM a) 
 run = runActionM . snd . getProgram
 
 toCode :: Monad m => Program' m a -> [Code]
-toCode prog = fst . getProgram $ prog none
+toCode prog = fst . getProgram $ prog none undefined
 
-none :: Monad m => Code -> VM a -> m (VM a)
-none = const return
+none :: Monad m => Logger m a
+none _ _ = return
 
--- запуск программы вне монад
-exec :: Pure () -> VM ()
-exec = runIdentity . execM
+exec :: Program' Identity () -> VM ()
+exec prog = runIdentity $ run (prog none undefined) (mkVM ())
 
-execM :: Monad m => Program' m () -> m (VM ())
-execM prog = run (prog none) (mkVM ())
+execM :: PrimMonad m => Program' m () -> m (VM ())
+execM prog = do m <- M.replicate memSize 0
+                run (prog none m) (mkVM ())
 
-execLog p prog = run (prog logger) (mkVM mempty)
-  where logger c vm = return $ addRecord (p c vm) vm
+execList :: Program' [] () -> [VM ()]
+execList prog = run (prog none undefined) (mkVM ())
+
+--execLogM :: (Semigroup a, Monoid a, PrimMonad m) => (Code -> VM a -> a) -> Program' m a -> m (VM a)
+execLogM p prog = do m <- M.replicate memSize 0
+                     run (prog logger m) (mkVM mempty)
+  where logger m c vm = do m' <- V.freeze m
+                           addRecord (p m' c vm) vm
 
 f &&& g = \c -> \r -> (f c r, g c r)
 
-logStack _ vm   = [stack vm]
-logStackUsed _ = Max . length . stack
-logSteps _     = const (Sum 1)
-logCode c _   = [c]
-logRun com vm = [pad 10 c ++ "| " ++ pad 20 s ++ "| " ++ m]
+logStack _ _ vm   = [stack vm]
+logStackUsed _ _ = Max . length . stack
+logSteps _ _     = const (Sum 1)
+logCode _ c _   = [c]
+logRun mem com vm = [pad 10 c ++ "| " ++ pad 20 s ++ "| " ++ m ]
   where c = show com
-        m = unwords $ show <$> toList (memory vm)
+        m = unwords $ show <$> V.toList mem
         s = unwords $ show <$> stack vm
         pad n x = take n (x ++ repeat ' ')
 
-debug p = unlines . reverse . journal <$> execLog logRun p
+debug :: Program' IO [String] -> IO ()
+debug p = do res <- execLogM logRun p
+             putStrLn (unlines . reverse . journal $ res) 
 
 ------------------------------------------------------------
-pop,dup,swap,exch,put,get :: Monad m => Program' m a
-puti,geti,push :: Monad m => Int -> Program' m a
+pop,dup,swap,exch :: Monad m => Program' m a
+push :: Monad m => Int -> Program' m a
 add,mul,sub,frac,modulo,inc,dec,neg :: Monad m => Program' m a
 eq,neq,lt,gt :: Monad m => Program' m a
 
@@ -129,23 +136,6 @@ exch = program EXCH $
   \case x:y:s -> setStack (y:x:y:s)
         _ -> err "expected two arguments."
 
-puti i = indexed (PUTI i) i $
-    \case (m, x:s) -> setStack s <=< setMemory (m // [(i,x)])
-          _ -> err "put expected an argument"
-
-geti i = indexed (GETI i) i $ \(m, s) -> setStack ((m ! i) : s)
-
-put = programM PUT $ 
-    \case (m, i:x:s) -> setStack s <=< setMemory (m // [(i,x)])
-          _ -> err "put expected an argument"
-
-get = programM GET $ \(m, i:s) -> setStack ((m ! i) : s)
-
-
-indexed c i f = programM c $ if (i < 0 || i >= memSize)
-                             then const $ err "index in [0,16]"
-                             else f
-
 unary c f = program c $
   \case x:s -> setStack (f x:s)
         _ -> err $ "operation " ++ show c ++ " expected an argument"
@@ -167,23 +157,23 @@ neq = binary NEQ (\x -> \y -> if (x /= y) then 1 else 0)
 lt = binary LTH (\x -> \y -> if (x > y) then 1 else 0)
 gt = binary GTH (\x -> \y -> if (x < y) then 1 else 0)
 
-proceed p prog s = run (prog p) <=< setStack s
+proceed m p prog s = run (prog p m) <=< setStack s
 
-rep body p = program (REP (toCode body)) go none
+rep body p m = program (REP (toCode body)) go none m
   where go (n:s) = if n >= 0
-                   then proceed p (stimes n body) s
+                   then proceed m p (stimes n body) s
                    else err "rep expected positive argument."
         go _ = err "rep expected an argument."
 
-branch br1 br2 p = program (IF (toCode br1) (toCode br2)) go none
-   where go (x:s) = proceed p (if (x /= 0) then br1 else br2) s
+branch br1 br2 p m = program (IF (toCode br1) (toCode br2)) go none m
+   where go (x:s) = proceed m p (if (x /= 0) then br1 else br2) s
          go _ = err "branch expected an argument."
 
-while test body p = program (WHILE (toCode test) (toCode body)) (const go) none
-  where go vm = do res <- proceed p test (stack vm) vm
+while test body p m = program (WHILE (toCode test) (toCode body)) (const go) none m
+  where go vm = do res <- proceed m p test (stack vm) vm
                    case (stack res) of
-                     0:s -> proceed p mempty s res
-                     _:s -> go =<< proceed p body s res
+                     0:s -> proceed m p mempty s res
+                     _:s -> go =<< proceed m p body s res
                      _ -> err "while expected an argument." vm
 
 ask :: Program' IO a
@@ -201,8 +191,29 @@ prtS s = program (PRTS s) $
   const $ \vm -> print s >> return vm
 
 fork :: Program' [] a -> Program' [] a -> Program' [] a
-fork br1 br2 p = program (FORK (toCode br1) (toCode br2)) (const go) none
-  where go = run (br1 p) <> run (br2 p)
+fork br1 br2 p m = program (FORK (toCode br1) (toCode br2)) (const go) none m
+  where go = run (br1 p m) <> run (br2 p m)
+
+geti :: PrimMonad m => Int -> Program' m a
+geti i = programM (GETI i) $
+  \m -> \s -> \vm -> do x <- M.read m i
+                        setStack (x:s) vm
+
+puti :: PrimMonad m => Int -> Program' m a
+puti i = programM (PUTI i) $
+  \m -> \case x:s -> \vm -> M.write m i x >> setStack s vm
+              _ -> err "expected an element"
+
+get :: PrimMonad m => Program' m a
+get = programM (GET) $
+  \m -> \case i:s -> \vm -> do x <- M.read m i
+                               setStack (x:s) vm
+              _ -> err "expected an element"
+
+put :: PrimMonad m => Program' m a
+put = programM (PUT) $
+  \m -> \case i:x:s -> \vm -> M.write m i x >> setStack s vm
+              _ -> err "expected two elemets"
 
 ------------------------------------------------------------
 
@@ -213,10 +224,6 @@ fromCode = hom
       IF b1 b2 -> branch (hom b1) (hom b2)
       REP p -> rep (hom p)
       WHILE t b -> while (hom t) (hom b)
-      PUTI i -> puti i
-      GETI i -> geti i
-      PUT -> put
-      GET -> get
       PUSH i -> push i
       POP -> pop
       DUP -> dup
@@ -235,6 +242,19 @@ fromCode = hom
       NEQ -> neq
       NEG -> neg
       _ -> mempty
+
+fromCodeM ::  PrimMonad m => [Code] -> Program' m a
+fromCodeM = hom
+  where
+    hom = foldMap $ \case
+      IF b1 b2 -> branch (hom b1) (hom b2)
+      REP p -> rep (hom p)
+      WHILE t b -> while (hom t) (hom b)
+      PUTI i -> puti i
+      GETI i -> geti i
+      PUT -> put
+      GET -> get
+      c -> fromCode [c]
 
 fromCodeIO :: [Code] -> Program' IO a
 fromCodeIO = hom
@@ -311,72 +331,21 @@ listing = unlines . printCode 0 . toCode
     printCode n = foldMap f
       where
         f = \case
-          IF b1 b2 -> print "IF" <> indent b1 <> print ":" <> indent b2
-          REP p -> print "REP" <> indent p
-          WHILE t b -> print "WHILE" <> indent t <> indent b
-          FORK b1 b2 -> print "FORK" <> indent b1 <>
-                        print " /" <> print " \\" <> indent b2
-          c -> print $ show c
+          IF b1 b2 -> output "IF" <> indent b1 <> output ":" <> indent b2
+          REP p -> output "REP" <> indent p
+          WHILE t b -> output "WHILE" <> indent t <> indent b
+          FORK b1 b2 -> output "FORK" <> indent b1 <>
+                        output " /" <> output " \\" <> indent b2
+          c -> output $ show c
 
-        print x = [stimes n "  " ++ x]
+        output x = [stimes n "  " ++ x]
         indent = printCode (n+1)
-
-------------------------------------------------------------
--- memory requirements as a homomorpism: Program -> Max Int
-
-memoryUse :: Monad m => Program' m a -> Max Int
-memoryUse = memoryUse' . toCode
-
-memoryUse' = hom
-  where
-    hom = foldMap $
-      \case
-        IF b1 b2 -> hom b1 <> hom b2
-        REP p -> hom p
-        WHILE t b -> hom t <> hom b
-        FORK t b -> hom t <> hom b
-        PUTI i -> Max (i+1)
-        GETI i -> Max (i+1)
-        _ -> 0
-
-------------------------------------------------------------
--- reduction using homomorphisms : `arity` and `memoryUse`
--- works only for pure code
-
-isReducible :: [Code] -> Bool
-isReducible p = case arity' p of
-                  0:>_ -> memoryUse' p == 0
-                  _    -> False
-
-reducible :: [Code] -> [[Code]]
-reducible = go []
-  where go res [] = reverse res
-        go res (p:ps) = if isReducible [p]
-                        then let (a,b) = spanBy isReducible (p:ps)
-                             in go (a:res) b
-                        else go res ps
-
-spanBy test l = case foldMap tst $ zip (inits l) (tails l) of
-                  Last Nothing -> ([],l)
-                  Last (Just x) -> x
-  where tst x = Last $ if test (fst x) then Just x else Nothing 
-
-
-reduce :: Pure a -> Pure a
-reduce = fromCode . reduce' . toCode
-
-reduce' :: [Code] -> [Code]
-reduce' p = process (reducible p) p
-  where
-    process = appEndo . foldMap (\x -> Endo $ x `replaceBy` shrink x)
-    shrink = foldMap (\x -> [PUSH x]) . reverse . stack . exec . fromCode
-    replaceBy x y = intercalate y . splitOn x
 
 
 ------------------------------------------------------------
 -- Example programs
 
-fact,range,fact1,fact2,fact3,copy2,gcd1,pow :: Monad m => Program' m a
+fact,range,fact1,fact2,copy2,gcd1 :: Monad m => Program' m a
 
 fact = dup <> push 2 <> lt <>
        branch (push 1) (dup <> dec <> fact) <>
@@ -394,13 +363,6 @@ range = exch <> sub <> dup<> push 0 <> gt <>
 
 fact2 = inc <> push 1 <> swap <> range <> dec <> dec <> rep mul
 
-fact3 = dup <> puti 0 <> dup <> dec <>
-        rep
-        (
-          dec <> dup <> geti 0 <> mul <> puti 0
-        ) <>
-        geti 0 <> swap <> pop
-
 copy2 = exch <> exch
 
 gcd1 = while (copy2 <> neq)
@@ -408,6 +370,14 @@ gcd1 = while (copy2 <> neq)
          copy2 <> lt <> branch mempty swap <> exch <> sub
        ) <>
        pop
+
+fact3,pow :: PrimMonad m => Program' m a
+fact3 = dup <> puti 0 <> dup <> dec <>
+        rep
+        (
+          dec <> dup <> geti 0 <> mul <> puti 0
+        ) <>
+        geti 0 <> swap <> pop
 
 pow = swap <> puti 0 <> push 1 <> puti 1 <>
       while (dup <> push 0 <> gt)
@@ -425,22 +395,6 @@ ioprog = prtS "first number" <> ask
          <> rep (prt <> dup <> inc)
          <> prt
 
-test :: Monad m => Program' m a 
-test = push 8 <>
-  dup <> fact1 <> swap <>
-  dup <> fact2 <> swap <>
-  dup <> fact3 <> swap <>
-  push 54 <> gcd1 <>
-  dup <> push 20 <> pow 
-
-
-fillMemory :: Monad m => Program' m a
-fillMemory = dup <> dup <> puti 0 <> 
-             while (dup <> push memSize <> geti 0 <> sub <> lt)
-             (
-               exch <> add <> dup <> push 1 <> swap <> put
-             ) <>
-             pop <> pop
 
 fill :: Program' IO a
 fill = dup <> puti 0 <>
@@ -453,4 +407,14 @@ sieve = push 2 <>
         while (dup <> dup <> mul <> push memSize <> lt)
         (fill <> geti 0 <> inc)
 
-main = execM (sieve <> prtS "Ok")
+main = execM (stimes 100 sieve <> prtS "Ok")
+
+test :: Program' IO a 
+test = push 8 <>
+  dup <> fact1 <> swap <>
+  dup <> fact2 <> swap <>
+  dup <> fact3 <> swap <>
+  push 54 <> gcd1 <>
+  dup <> push 20 <> pow 
+
+--main = execM (stimes 10000 test <> prtS "Ok")

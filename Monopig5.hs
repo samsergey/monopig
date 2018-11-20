@@ -1,4 +1,4 @@
-{-# LANGUAGE LambdaCase, GeneralizedNewtypeDeriving, TupleSections #-}
+{-# LANGUAGE LambdaCase, GeneralizedNewtypeDeriving, TupleSections,BangPatterns #-}
 
 module Main where
 
@@ -12,7 +12,7 @@ import qualified Data.Vector.Unboxed.Mutable as M
 
 type Stack = [Int]
 
-memSize = 65000
+memSize = 65536
 
 data VM a = VM { stack :: Stack
                , status :: Maybe String
@@ -21,6 +21,7 @@ data VM a = VM { stack :: Stack
 
 mkVM = VM mempty mempty
 
+{-# INLINE setStack #-}
 setStack  x (VM _ st l) = return $ VM x st l
 setStatus st (VM s _ l) = return $ VM s st l
 addRecord x (VM s st l) = return $ VM s st (x<>l)
@@ -56,41 +57,46 @@ newtype Program m a = Program { getProgram :: ([Code], ActionM m (VM a)) }
   deriving (Semigroup, Monoid)
 
 type Memory m = M.MVector (PrimState m) Int
-type Logger m a = Memory m  -> Code -> VM a -> m (VM a)
+type Logger m a = Maybe (Memory m  -> Code -> VM a -> m (VM a))
 type Program' m a = Logger m a -> Memory m -> Program m a
 
-program c f p v = Program . ([c],) . ActionM $
+program c f (Just p) v = Program . ([c],) . ActionM $
   \vm -> case status vm of
     Nothing -> p v c =<< f (stack vm) vm
-    m -> return vm
+    _ -> return vm
+program c f _ _ = Program . ([c],) . ActionM $
+  \vm -> case status vm of
+    Nothing -> f (stack vm) vm
+    _ -> return vm
 
-programM c f p v = Program . ([c],) . ActionM $
+programM c f (Just p) v = Program . ([c],) . ActionM $
   \vm -> case status vm of
     Nothing -> p v c =<< f v (stack vm) vm
-    m -> return vm
+    _ -> return vm
+programM c f _ v = Program . ([c],) . ActionM $
+  \vm -> case status vm of
+    Nothing -> f v (stack vm) vm
+    _ -> return vm
 
-run :: Monad m => Program m a -> VM a -> m (VM a) 
+run :: Monad m => Program m a -> VM a -> m (VM a)
 run = runActionM . snd . getProgram
 
 toCode :: Monad m => Program' m a -> [Code]
-toCode prog = fst . getProgram $ prog none undefined
-
-none :: Monad m => Logger m a
-none _ _ = return
+toCode prog = fst . getProgram $ prog Nothing undefined
 
 exec :: Program' Identity () -> VM ()
-exec prog = runIdentity $ run (prog none undefined) (mkVM ())
+exec prog = runIdentity $ run (prog Nothing undefined) (mkVM ())
 
 execM :: PrimMonad m => Program' m () -> m (VM ())
 execM prog = do m <- M.replicate memSize 0
-                run (prog none m) (mkVM ())
+                run (prog Nothing m) (mkVM ())
 
 execList :: Program' [] () -> [VM ()]
-execList prog = run (prog none undefined) (mkVM ())
+execList prog = run (prog Nothing undefined) (mkVM ())
 
 --execLogM :: (Semigroup a, Monoid a, PrimMonad m) => (Code -> VM a -> a) -> Program' m a -> m (VM a)
 execLogM p prog = do m <- M.replicate memSize 0
-                     run (prog logger m) (mkVM mempty)
+                     run (prog (Just logger) m) (mkVM mempty)
   where logger m c vm = do m' <- V.freeze m
                            addRecord (p m' c vm) vm
 
@@ -118,58 +124,78 @@ eq,neq,lt,gt :: Monad m => Program' m a
 
 err m = setStatus . Just $ "Error : " ++ m
 
+{-# INLINE pop #-}
 pop = program POP $ 
-  \case x:s -> setStack s
+  \case _:s -> setStack s
         _ -> err "pop expected an argument."
 
+{-# INLINE push #-}
 push x = program (PUSH x) $ \s -> setStack (x:s)
 
+{-# INLINE dup #-}
 dup = program DUP $ 
   \case x:s -> setStack (x:x:s)
         _ -> err "dup expected an argument."
 
+{-# INLINE swap #-}
 swap = program SWAP $ 
   \case x:y:s -> setStack (y:x:s)
         _ -> err "swap expected two arguments."
 
+{-# INLINE exch #-}
 exch = program EXCH $ 
   \case x:y:s -> setStack (y:x:y:s)
         _ -> err "expected two arguments."
 
+{-# INLINE unary #-}
 unary c f = program c $
   \case x:s -> setStack (f x:s)
         _ -> err $ "operation " ++ show c ++ " expected an argument"
 
+{-# INLINE binary #-}
 binary c f = program c $
   \case x:y:s -> setStack (f x y:s)
         _ -> err $ "operation " ++ show c ++ " expected two arguments"
 
+{-# INLINE add #-}
 add = binary ADD (+)
+{-# INLINE sub #-}
 sub = binary SUB (flip (-))
+{-# INLINE mul #-}
 mul = binary MUL (*)
+{-# INLINE frac #-}
 frac = binary DIV (flip div)
+{-# INLINE modulo #-}
 modulo = binary MOD (flip mod)
+{-# INLINE neg #-}
 neg = unary NEG (\x -> -x)
+{-# INLINE inc #-}
 inc = unary INC (\x -> x+1)
+{-# INLINE dec #-}
 dec = unary DEC (\x -> x-1)
+{-# INLINE eq #-}
 eq = binary EQL (\x -> \y -> if (x == y) then 1 else 0)
+{-# INLINE neq #-}
 neq = binary NEQ (\x -> \y -> if (x /= y) then 1 else 0)
+{-# INLINE lt #-}
 lt = binary LTH (\x -> \y -> if (x > y) then 1 else 0)
+{-# INLINE gt #-}
 gt = binary GTH (\x -> \y -> if (x < y) then 1 else 0)
 
+{-# INLINE proceed #-}
 proceed m p prog s = run (prog p m) <=< setStack s
 
-rep body p m = program (REP (toCode body)) go none m
+rep body p m = program (REP (toCode body)) go Nothing m
   where go (n:s) = if n >= 0
                    then proceed m p (stimes n body) s
                    else err "rep expected positive argument."
         go _ = err "rep expected an argument."
 
-branch br1 br2 p m = program (IF (toCode br1) (toCode br2)) go none m
+branch br1 br2 p m = program (IF (toCode br1) (toCode br2)) go Nothing m
    where go (x:s) = proceed m p (if (x /= 0) then br1 else br2) s
          go _ = err "branch expected an argument."
 
-while test body p m = program (WHILE (toCode test) (toCode body)) (const go) none m
+while test body p m = program (WHILE (toCode test) (toCode body)) (const go) Nothing m
   where go vm = do res <- proceed m p test (stack vm) vm
                    case (stack res) of
                      0:s -> proceed m p mempty s res
@@ -191,28 +217,32 @@ prtS s = program (PRTS s) $
   const $ \vm -> print s >> return vm
 
 fork :: Program' [] a -> Program' [] a -> Program' [] a
-fork br1 br2 p m = program (FORK (toCode br1) (toCode br2)) (const go) none m
+fork br1 br2 p m = program (FORK (toCode br1) (toCode br2)) (const go) Nothing m
   where go = run (br1 p m) <> run (br2 p m)
 
 geti :: PrimMonad m => Int -> Program' m a
+{-# INLINE geti #-}
 geti i = programM (GETI i) $
-  \m -> \s -> \vm -> do x <- M.read m i
+  \m -> \s -> \vm -> do x <- M.unsafeRead m i
                         setStack (x:s) vm
 
 puti :: PrimMonad m => Int -> Program' m a
+{-# INLINE puti #-}
 puti i = programM (PUTI i) $
-  \m -> \case x:s -> \vm -> M.write m i x >> setStack s vm
+  \m -> \case x:s -> \vm -> M.unsafeWrite m i x >> setStack s vm
               _ -> err "expected an element"
 
 get :: PrimMonad m => Program' m a
+{-# INLINE get #-}
 get = programM (GET) $
-  \m -> \case i:s -> \vm -> do x <- M.read m i
+  \m -> \case i:s -> \vm -> do x <- M.unsafeRead m i
                                setStack (x:s) vm
               _ -> err "expected an element"
 
 put :: PrimMonad m => Program' m a
+{-# INLINE put #-}
 put = programM (PUT) $
-  \m -> \case i:x:s -> \vm -> M.write m i x >> setStack s vm
+  \m -> \case i:x:s -> \vm -> M.unsafeWrite m i x >> setStack s vm
               _ -> err "expected two elemets"
 
 ------------------------------------------------------------
@@ -332,8 +362,9 @@ listing = unlines . printCode 0 . toCode
       where
         f = \case
           IF b1 b2 -> output "IF" <> indent b1 <> output ":" <> indent b2
-          REP p -> output "REP" <> indent p
-          WHILE t b -> output "WHILE" <> indent t <> indent b
+          REP p -> output "REP" <>  output "{" <> indent p <> output "}"
+          WHILE t b -> output "WHILE" <> indent t <>
+                       output "{" <> indent b <> output "}"
           FORK b1 b2 -> output "FORK" <> indent b1 <>
                         output " /" <> output " \\" <> indent b2
           c -> output $ show c
@@ -395,11 +426,10 @@ ioprog = prtS "first number" <> ask
          <> rep (prt <> dup <> inc)
          <> prt
 
-
 fill :: Program' IO a
 fill = dup <> puti 0 <>
        while (dup <> push memSize <> geti 0 <> sub <> lt)
-       (geti 0 <> add <> dup <> push 1 <> swap <> put) <>
+       (geti 0 <> add <> push 1 <> exch <> put) <>
        pop
 
 sieve :: Program' IO a

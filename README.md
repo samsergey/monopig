@@ -10,3 +10,4 @@ All files are selfcontaining independent haskel modules.
 - `Monopig2.hs` -- addition of arbitrary logging.
 - `Monopig3.hs` -- addition of isomorphism between EDSL and a free algebra representing code. Homomorphisms to pretty printing, arity and memory requariments, some optimisation.
 - `Monopig4.hs` -- implementation of monoidal stack machine in Kleisli category. Using `IO` and `[]` monads for effects.
+- `Monopig5.hs` -- implementation of monoidal stack machine in Kleisli category. Using `IO` monads and mutable vectors to boost the speed.

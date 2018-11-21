@@ -1,4 +1,4 @@
-{-# LANGUAGE LambdaCase, GeneralizedNewtypeDeriving, TupleSections,BangPatterns #-}
+{-# LANGUAGE LambdaCase, GeneralizedNewtypeDeriving, TupleSections, BangPatterns #-}
 
 module Main where
 
@@ -12,7 +12,7 @@ import qualified Data.Vector.Unboxed.Mutable as M
 
 type Stack = [Int]
 
-memSize = 65536
+memSize = 65536 --36
 
 data VM a = VM { stack :: Stack
                , status :: Maybe String
@@ -21,10 +21,10 @@ data VM a = VM { stack :: Stack
 
 mkVM = VM mempty mempty
 
-{-# INLINE setStack #-}
+{-# INLINE setStack #-} 
 setStack  x (VM _ st l) = return $ VM x st l
 setStatus st (VM s _ l) = return $ VM s st l
-addRecord x (VM s st l) = return $ VM s st (x<>l)
+addRecord x (VM s st l) = return $ VM s st (x l)
 
 ------------------------------------------------------------
 
@@ -60,25 +60,18 @@ type Memory m = M.MVector (PrimState m) Int
 type Logger m a = Maybe (Memory m  -> Code -> VM a -> m (VM a))
 type Program' m a = Logger m a -> Memory m -> Program m a
 
-program c f (Just p) v = Program . ([c],) . ActionM $
+programM c f l v = Program . ([c],) . ActionM $
   \vm -> case status vm of
-    Nothing -> p v c =<< f (stack vm) vm
+    Nothing -> go vm
     _ -> return vm
-program c f _ _ = Program . ([c],) . ActionM $
-  \vm -> case status vm of
-    Nothing -> f (stack vm) vm
-    _ -> return vm
+  where
+    go = case l of
+      Just p -> \vm -> p v c =<< f v (stack vm) vm
+      _ -> \vm -> f v (stack vm) vm
 
-programM c f (Just p) v = Program . ([c],) . ActionM $
-  \vm -> case status vm of
-    Nothing -> p v c =<< f v (stack vm) vm
-    _ -> return vm
-programM c f _ v = Program . ([c],) . ActionM $
-  \vm -> case status vm of
-    Nothing -> f v (stack vm) vm
-    _ -> return vm
+program c f = programM c (const f)
 
-run :: Monad m => Program m a -> VM a -> m (VM a)
+run :: Monad m => Program m a -> VM a -> m (VM a) 
 run = runActionM . snd . getProgram
 
 toCode :: Monad m => Program' m a -> [Code]
@@ -98,13 +91,19 @@ execList prog = run (prog Nothing undefined) (mkVM ())
 execLogM p prog = do m <- M.replicate memSize 0
                      run (prog (Just logger) m) (mkVM mempty)
   where logger m c vm = do m' <- V.freeze m
-                           addRecord (p m' c vm) vm
+                           addRecord (p m' c vm <>) vm
+
+execLog p x0 prog = do m <- M.replicate memSize 0
+                       run (prog (Just logger) m) (mkVM x0)
+  where logger m c = addRecord (p undefined c)
+                           
 
 f &&& g = \c -> \r -> (f c r, g c r)
 
 logStack _ _ vm   = [stack vm]
 logStackUsed _ _ = Max . length . stack
-logSteps _ _     = const (Sum 1)
+logSteps _ _ !x = x + 1
+logSteps' _ _ _ = Sum 1
 logCode _ c _   = [c]
 logRun mem com vm = [pad 10 c ++ "| " ++ pad 20 s ++ "| " ++ m ]
   where c = show com
@@ -126,7 +125,7 @@ err m = setStatus . Just $ "Error : " ++ m
 
 {-# INLINE pop #-}
 pop = program POP $ 
-  \case _:s -> setStack s
+  \case (_:s) -> setStack s
         _ -> err "pop expected an argument."
 
 {-# INLINE push #-}
@@ -134,27 +133,27 @@ push x = program (PUSH x) $ \s -> setStack (x:s)
 
 {-# INLINE dup #-}
 dup = program DUP $ 
-  \case x:s -> setStack (x:x:s)
+  \case (x:s) -> setStack (x:x:s)
         _ -> err "dup expected an argument."
 
 {-# INLINE swap #-}
 swap = program SWAP $ 
-  \case x:y:s -> setStack (y:x:s)
+  \case (x:y:s) -> setStack (y:x:s)
         _ -> err "swap expected two arguments."
 
 {-# INLINE exch #-}
 exch = program EXCH $ 
-  \case x:y:s -> setStack (y:x:y:s)
+  \case (x:y:s) -> setStack (y:x:y:s)
         _ -> err "expected two arguments."
 
 {-# INLINE unary #-}
 unary c f = program c $
-  \case x:s -> setStack (f x:s)
+  \case (x:s) -> setStack (f x:s)
         _ -> err $ "operation " ++ show c ++ " expected an argument"
 
 {-# INLINE binary #-}
 binary c f = program c $
-  \case x:y:s -> setStack (f x y:s)
+  \case (x:y:s) -> setStack (f x y:s)
         _ -> err $ "operation " ++ show c ++ " expected two arguments"
 
 {-# INLINE add #-}
@@ -198,7 +197,7 @@ branch br1 br2 p m = program (IF (toCode br1) (toCode br2)) go Nothing m
 while test body p m = program (WHILE (toCode test) (toCode body)) (const go) Nothing m
   where go vm = do res <- proceed m p test (stack vm) vm
                    case (stack res) of
-                     0:s -> proceed m p mempty s res
+                     (0:s) -> proceed m p mempty s res
                      _:s -> go =<< proceed m p body s res
                      _ -> err "while expected an argument." vm
 
@@ -209,7 +208,7 @@ ask = program ASK $
 
 prt :: Program' IO a
 prt = program PRT $
-  \case x:s -> \vm -> print x >> return vm
+  \case (x:s) -> \vm -> print x >> return vm
         _ -> err "PRT expected an argument"
 
 prtS :: String -> Program' IO a
@@ -229,20 +228,20 @@ geti i = programM (GETI i) $
 puti :: PrimMonad m => Int -> Program' m a
 {-# INLINE puti #-}
 puti i = programM (PUTI i) $
-  \m -> \case x:s -> \vm -> M.unsafeWrite m i x >> setStack s vm
+  \m -> \case (x:s) -> \vm -> M.unsafeWrite m i x >> setStack s vm
               _ -> err "expected an element"
 
 get :: PrimMonad m => Program' m a
 {-# INLINE get #-}
 get = programM (GET) $
-  \m -> \case i:s -> \vm -> do x <- M.unsafeRead m i
-                               setStack (x:s) vm
+  \m -> \case (i:s) -> \vm -> do x <- M.read m i
+                                 setStack (x:s) vm
               _ -> err "expected an element"
 
 put :: PrimMonad m => Program' m a
 {-# INLINE put #-}
 put = programM (PUT) $
-  \m -> \case i:x:s -> \vm -> M.unsafeWrite m i x >> setStack s vm
+  \m -> \case (i:x:s) -> \vm -> M.write m i x >> setStack s vm
               _ -> err "expected two elemets"
 
 ------------------------------------------------------------
@@ -362,9 +361,8 @@ listing = unlines . printCode 0 . toCode
       where
         f = \case
           IF b1 b2 -> output "IF" <> indent b1 <> output ":" <> indent b2
-          REP p -> output "REP" <>  output "{" <> indent p <> output "}"
-          WHILE t b -> output "WHILE" <> indent t <>
-                       output "{" <> indent b <> output "}"
+          REP p -> output "REP" <> indent p
+          WHILE t b -> output "WHILE" <> indent t <> indent b
           FORK b1 b2 -> output "FORK" <> indent b1 <>
                         output " /" <> output " \\" <> indent b2
           c -> output $ show c
@@ -426,6 +424,14 @@ ioprog = prtS "first number" <> ask
          <> rep (prt <> dup <> inc)
          <> prt
 
+test :: Program' IO a 
+test = stimes 100 $
+  push 8 <>
+  dup <> fact1 <> swap <>
+  dup <> fact2 <> swap <>
+  dup <> fact3 <> swap <>
+  push 54 <> gcd1 <> pow <> gcd1 <> eq <> pop
+
 fill :: Program' IO a
 fill = dup <> dup <> puti 0 <>
        while (dup <> push memSize <> geti 0 <> sub <> lt)
@@ -435,17 +441,7 @@ fill = dup <> dup <> puti 0 <>
 sieve :: Program' IO a
 sieve = push 2 <>
         while (dup <> dup <> mul <> push memSize <> lt)
-        (dup <> get <> branch mempty fill <> inc)
+        (dup <> get <> branch mempty fill <> inc) 
 
-
-main = execM (stimes 100 sieve <> prtS "Ok")
-
-test :: Program' IO a 
-test = stimes 100 $
-  push 8 <>
-  dup <> fact1 <> swap <>
-  dup <> fact2 <> swap <>
-  dup <> fact3 <> swap <>
-  push 54 <> gcd1 <> pow <> gcd1 <> eq <> pop 
-
---main = execM (stimes 10000 test <> prtS "Ok")
+main = print =<< journal <$> execLog logSteps 0 (stimes 100 sieve <> prtS "Ok")
+-- main = execM (stimes 100 sieve <> prtS "Ok")

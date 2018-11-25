@@ -16,9 +16,9 @@ type Memory = Vector Int
 
 memSize = 65536 :: Int
 
-data VM a = VM { stack :: Stack
+data VM a = VM { stack :: !Stack
                , status :: Maybe String
-               , memory :: Memory
+               , memory :: !Memory
                , journal :: a }
 --            deriving Show
 
@@ -446,8 +446,8 @@ sieve = push 2 <>
         (dup <> get <> branch mempty fill <> inc) <>
         pop
 
-main = execM (sieve <> prtS "Ok")
---main = print $ sieve' 2 $ V.replicate memSize 0
+--main = execM (sieve <> prtS "Ok")
+main = print $ sieve' 2 $ V.replicate memSize 0
 
 fill' :: Int -> Int -> Memory -> Memory
 fill' k n m
@@ -456,8 +456,8 @@ fill' k n m
 
 sieve' :: Int -> Memory -> Memory
 sieve' k m
-  | k*k < memSize = sieve' (k+1) $
-                    if m ! k == 0 then fill' k (2*k) m else m
+  | k*k < memSize =
+      sieve' (k+1) $ if m ! k == 0 then fill' k (2*k) m else m
   | otherwise = m
 
 --check = map fst . filter (\(_,x) -> x == 0) . zip [0..] . toList . sieve' 2 $ V.replicate memSize 0

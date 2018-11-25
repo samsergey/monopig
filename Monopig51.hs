@@ -22,6 +22,7 @@ data VM a = VM { stack :: !Stack
 
 mkVM = VM mempty mempty
 
+{-# INLINE setStack #-} 
 setStack  x (VM _ st l) = return $ VM x st l
 setStatus st (VM s _ l) = return $ VM s st l
 addRecord x (VM s st l) = return $ VM s st (x <> l)
@@ -121,45 +122,65 @@ eq,neq,lt,gt :: Monad m => Program' m a
 
 err m = setStatus . Just $ "Error : " ++ m
 
+{-# INLINE pop #-}
 pop = program POP $ 
   \case (_:s) -> setStack s
         _ -> err "pop expected an argument."
 
+{-# INLINE push #-}
 push x = program (PUSH x) $ \s -> setStack (x:s)
 
+{-# INLINE dup #-}
 dup = program DUP $ 
   \case s@(x:_) -> setStack (x:s)
         _ -> err "dup expected an argument."
 
+{-# INLINE swap #-}
 swap = program SWAP $ 
   \case (x:y:s) -> setStack (y:x:s)
         _ -> err "swap expected two arguments."
 
+{-# INLINE exch #-}
 exch = program EXCH $ 
   \case s@(_:y:_) -> setStack (y:s)
         _ -> err "expected two arguments."
 
+{-# INLINE unary #-}
 unary code f = program code $
   \case (x:s) -> setStack (f x:s)
         _ -> err $ "operation " ++ show code ++ " expected an argument"
 
+{-# INLINE binary #-}
 binary code f = program code $
   \case (x:y:s) -> setStack (f x y:s)
         _ -> err $ "operation " ++ show code ++ " expected two arguments"
 
+{-# INLINE add #-}
 add = binary ADD (+)
+{-# INLINE sub #-}
 sub = binary SUB (flip (-))
+{-# INLINE mul #-}
 mul = binary MUL (*)
+{-# INLINE frac #-}
 frac = binary DIV (flip div)
+{-# INLINE modulo #-}
 modulo = binary MOD (flip mod)
+{-# INLINE neg #-}
 neg = unary NEG (\x -> -x)
+{-# INLINE inc #-}
 inc = unary INC (\x -> x+1)
+{-# INLINE dec #-}
 dec = unary DEC (\x -> x-1)
+{-# INLINE eq #-}
 eq = binary EQL (\x -> \y -> if (x == y) then 1 else 0)
+{-# INLINE neq #-}
 neq = binary NEQ (\x -> \y -> if (x /= y) then 1 else 0)
+{-# INLINE lt #-}
 lt = binary LTH (\x -> \y -> if (x > y) then 1 else 0)
+{-# INLINE gt #-}
 gt = binary GTH (\x -> \y -> if (x < y) then 1 else 0)
 
+{-# INLINE proceed #-}
 proceed prog s logger mem = setStack s >=> run (prog logger mem)
 
 rep body logger mem = program code f none mem
@@ -206,6 +227,7 @@ fork br1 br2 logger mem = program (FORK (toCode br1) (toCode br2)) (const go) no
   where go = run (br1 logger mem) <> run (br2 logger mem)
 
 geti :: PrimMonad m => Int -> Program' m a
+{-# INLINE geti #-}
 geti i = programM (GETI i) $
   \mem -> \s -> if (0 <= i && i < memSize)
                 then \vm -> do x <- M.unsafeRead mem i
@@ -213,6 +235,7 @@ geti i = programM (GETI i) $
                 else err "GETI got index out of range"
 
 puti :: PrimMonad m => Int -> Program' m a
+{-# INLINE puti #-}
 puti i = programM (PUTI i) $
   \mem -> \case (x:s) -> if (0 <= i && i < memSize)
                          then \vm -> M.unsafeWrite mem i x >> setStack s vm
@@ -220,12 +243,14 @@ puti i = programM (PUTI i) $
                 _ -> err "PUTI expected an element"
 
 get :: PrimMonad m => Program' m a
+{-# INLINE get #-}
 get = programM (GET) $
   \mem -> \case (i:s) -> \vm -> do x <- M.read mem i
                                    setStack (x:s) vm
                 _ -> err "GET expected an element"
 
 put :: PrimMonad m => Program' m a
+{-# INLINE put #-}
 put = programM (PUT) $
   \mem -> \case (i:x:s) -> \vm -> M.write mem i x >> setStack s vm
                 _ -> err "PUT expected two elemets"
@@ -430,9 +455,7 @@ sieve = push 2 <>
         pop
 
 --main = print =<< journal <$> execLog logSteps (stimes 100 sieve <> prtS "Ok")
-main' = execM (mtimes 100 sieve <> prtS "Ok")
-
-mtimes n = mconcat . replicate n
+main = execM (stimes 100 sieve <> prtS "Ok")
 
 fill' :: Int -> Int -> Memory IO -> IO (Memory IO)
 fill' k n m
@@ -449,5 +472,5 @@ sieve' k m
   | otherwise = return ()
   
 
-main = tst >> print "OK"
-  where tst = M.new memSize >>= mtimes 100 sieve' 2
+main' = (mconcat $ replicate 100 tst) >> print "OK"
+  where tst = M.replicate memSize 0 >>= sieve' 2

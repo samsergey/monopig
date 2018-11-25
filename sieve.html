@@ -1,0 +1,37 @@
+<script>
+
+var memSize = 65536;
+
+
+function sieve()
+{
+    var arr = [];
+    for (var i = 0; i < memSize; i++)
+	arr.push(0);
+
+    var n = 2;
+    while (n*n < memSize)
+    {
+	if (!arr[n])
+	{
+	    var k = n;
+	    while (k < memSize)
+	    {
+		k+=n;
+		arr[k] = 1;
+	    }
+	}
+	n++;
+    }
+}
+		       
+//sieve();
+//var i = 0;
+//arr.forEach(p => {if (p==0) console.log(i); i++}) 
+
+var a = performance.now();
+for(var i=0;i<100;i++)
+    sieve();
+var b = performance.now();
+console.log('It took ' + (b - a) + ' ms.');
+</script>

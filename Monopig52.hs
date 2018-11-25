@@ -1,22 +1,25 @@
-{-# LANGUAGE LambdaCase, GeneralizedNewtypeDeriving, TupleSections, BangPatterns #-}
+{-# LANGUAGE LambdaCase, GeneralizedNewtypeDeriving, TupleSections #-}
 
 module Main where
 
 import Data.Monoid hiding ((<>))
 import Data.Semigroup (Semigroup(..),stimes,Max(..))
 import Control.Monad
+import Control.Monad.ST
 import Control.Monad.Primitive
 import Control.Monad.Identity
+import Control.DeepSeq
 import qualified Data.Vector.Unboxed as V
 import qualified Data.Vector.Unboxed.Mutable as M
 
 type Stack = [Int]
 
-memSize = 65536 --36
+memSize :: Int
+memSize = 65536
 
-data VM a = VM { stack :: Stack
+data VM a = VM { stack :: !Stack
                , status :: Maybe String
-               , journal :: a }
+               , journal :: !a }
             deriving Show
 
 mkVM = VM mempty mempty
@@ -24,7 +27,8 @@ mkVM = VM mempty mempty
 {-# INLINE setStack #-} 
 setStack  x (VM _ st l) = return $ VM x st l
 setStatus st (VM s _ l) = return $ VM s st l
-addRecord x (VM s st l) = return $ VM s st (x l)
+{-# INLINE addRecord #-} 
+addRecord x (VM s st l) = return $ VM s st (x <> l)
 
 ------------------------------------------------------------
 
@@ -48,7 +52,7 @@ instance Monad m => Semigroup (ActionM m a) where
   ActionM f <> ActionM g = ActionM (f >=> g)
 
 instance Monad m => Monoid (ActionM m a) where
-  ActionM f `mappend` ActionM g = ActionM (f >=> g)
+  mappend = (<>)
   mempty = ActionM return
 
 ------------------------------------------------------------
@@ -60,16 +64,16 @@ type Memory m = M.MVector (PrimState m) Int
 type Logger m a = Maybe (Memory m  -> Code -> VM a -> m (VM a))
 type Program' m a = Logger m a -> Memory m -> Program m a
 
-programM c f l v = Program . ([c],) . ActionM $
-  \vm -> case status vm of
-    Nothing -> go vm
-    _ -> return vm
-  where
-    go = case l of
-      Just p -> \vm -> p v c =<< f v (stack vm) vm
-      _ -> \vm -> f v (stack vm) vm
+program code f = programM code (const f)
 
-program c f = programM c (const f)
+programM code f (Just logger) mem = Program . ([code],) . ActionM $
+  \vm -> case status vm of
+    Nothing -> logger mem code =<< f mem (stack vm) vm
+    _ -> return vm
+programM code f _ mem = Program . ([code],) . ActionM $
+  \vm -> case status vm of
+    Nothing -> f mem (stack vm) vm
+    _ -> return vm
 
 run :: Monad m => Program m a -> VM a -> m (VM a) 
 run = runActionM . snd . getProgram
@@ -81,39 +85,40 @@ exec :: Program' Identity () -> VM ()
 exec prog = runIdentity $ run (prog Nothing undefined) (mkVM ())
 
 execM :: PrimMonad m => Program' m () -> m (VM ())
-execM prog = do m <- M.replicate memSize 0
-                run (prog Nothing m) (mkVM ())
+execM prog = do mem <- M.replicate memSize 0
+                run (prog Nothing mem) (mkVM ())
 
 execList :: Program' [] () -> [VM ()]
 execList prog = run (prog Nothing undefined) (mkVM ())
 
 --execLogM :: (Semigroup a, Monoid a, PrimMonad m) => (Code -> VM a -> a) -> Program' m a -> m (VM a)
-execLogM p prog = do m <- M.replicate memSize 0
-                     run (prog (Just logger) m) (mkVM mempty)
-  where logger m c vm = do m' <- V.freeze m
-                           addRecord (p m' c vm <>) vm
+execLogM logger prog = do mem <- M.replicate memSize 0
+                          run (prog (Just l) mem) (mkVM mempty)
+  where l mem code vm = do mem' <- V.freeze mem
+                           addRecord (logger mem' code vm) vm
 
-execLog p x0 prog = do m <- M.replicate memSize 0
-                       run (prog (Just logger) m) (mkVM x0)
-  where logger m c = addRecord (p undefined c)
-                           
+--
+execLog :: (PrimMonad m,  Semigroup a, Monoid a, NFData a) => (Memory m  -> Code -> VM a -> a) -> Program' m a -> m (VM a)
+execLog logger prog = do mem <- M.replicate memSize 0
+                         run (prog (Just l) mem) (mkVM mempty)
+  where l _ code vm = logger undefined code vm `deepseq` addRecord (logger undefined code vm) vm
 
-f &&& g = \c -> \r -> (f c r, g c r)
+
+f &&& g = \m -> \c -> \r -> (f m c r, g m c r)
 
 logStack _ _ vm   = [stack vm]
 logStackUsed _ _ = Max . length . stack
-logSteps _ _ !x = x + 1
-logSteps' _ _ _ = Sum 1
-logCode _ c _   = [c]
-logRun mem com vm = [pad 10 c ++ "| " ++ pad 20 s ++ "| " ++ m ]
-  where c = show com
+logSteps _ _ _ = Sum (1 :: Int)
+logCode _ code _   = [code]
+logRun mem code vm = [pad 10 c ++ "| " ++ pad 20 s ++ "| " ++ m ]
+  where c = show code
         m = unwords $ show <$> V.toList mem
         s = unwords $ show <$> stack vm
         pad n x = take n (x ++ repeat ' ')
 
 debug :: Program' IO [String] -> IO ()
-debug p = do res <- execLogM logRun p
-             putStrLn (unlines . reverse . journal $ res) 
+debug prog = do res <- execLogM logRun prog
+                putStrLn (unlines . reverse . journal $ res) 
 
 ------------------------------------------------------------
 pop,dup,swap,exch :: Monad m => Program' m a
@@ -133,7 +138,7 @@ push x = program (PUSH x) $ \s -> setStack (x:s)
 
 {-# INLINE dup #-}
 dup = program DUP $ 
-  \case (x:s) -> setStack (x:x:s)
+  \case s@(x:_) -> setStack (x:s)
         _ -> err "dup expected an argument."
 
 {-# INLINE swap #-}
@@ -143,18 +148,18 @@ swap = program SWAP $
 
 {-# INLINE exch #-}
 exch = program EXCH $ 
-  \case (x:y:s) -> setStack (y:x:y:s)
+  \case s@(_:y:_) -> setStack (y:s)
         _ -> err "expected two arguments."
 
 {-# INLINE unary #-}
-unary c f = program c $
+unary code f = program code $
   \case (x:s) -> setStack (f x:s)
-        _ -> err $ "operation " ++ show c ++ " expected an argument"
+        _ -> err $ "operation " ++ show code ++ " expected an argument"
 
 {-# INLINE binary #-}
-binary c f = program c $
+binary code f = program code $
   \case (x:y:s) -> setStack (f x y:s)
-        _ -> err $ "operation " ++ show c ++ " expected two arguments"
+        _ -> err $ "operation " ++ show code ++ " expected two arguments"
 
 {-# INLINE add #-}
 add = binary ADD (+)
@@ -182,24 +187,31 @@ lt = binary LTH (\x -> \y -> if (x > y) then 1 else 0)
 gt = binary GTH (\x -> \y -> if (x < y) then 1 else 0)
 
 {-# INLINE proceed #-}
-proceed m p prog s = run (prog p m) <=< setStack s
+proceed prog s logger mem = setStack s >=> run (prog logger mem)
 
-rep body p m = program (REP (toCode body)) go Nothing m
-  where go (n:s) = if n >= 0
-                   then proceed m p (stimes n body) s
-                   else err "rep expected positive argument."
-        go _ = err "rep expected an argument."
+rep body logger mem = program code f Nothing mem
+  where
+    code = REP (toCode body)
+    f (n:s) = if n >= 0
+               then proceed (stimes n body) s logger mem
+               else err "REP expected positive argument."
+    f _ = err "REP expected an argument."
 
-branch br1 br2 p m = program (IF (toCode br1) (toCode br2)) go Nothing m
-   where go (x:s) = proceed m p (if (x /= 0) then br1 else br2) s
-         go _ = err "branch expected an argument."
+branch br1 br2 logger mem = program code f Nothing mem
+   where
+     code = IF (toCode br1) (toCode br2)
+     f (x:s) = proceed (if (x == 0) then br2 else br1) s logger mem
+     f _ = err "BRANCH expected an argument."
 
-while test body p m = program (WHILE (toCode test) (toCode body)) (const go) Nothing m
-  where go vm = do res <- proceed m p test (stack vm) vm
-                   case (stack res) of
-                     (0:s) -> proceed m p mempty s res
-                     _:s -> go =<< proceed m p body s res
-                     _ -> err "while expected an argument." vm
+while test body logger mem = program code f Nothing mem
+  where
+    code = WHILE (toCode test) (toCode body)
+    f _ = run (test logger mem) >=> f'
+    f' vm =
+      case stack vm of
+        0:s -> setStack s vm
+        _:s -> proceed (body <> test) s logger mem vm >>= f'
+        _ -> err "WHILE expected an argument." vm
 
 ask :: Program' IO a
 ask = program ASK $
@@ -208,41 +220,46 @@ ask = program ASK $
 
 prt :: Program' IO a
 prt = program PRT $
-  \case (x:s) -> \vm -> print x >> return vm
+  \case (x:_) -> \vm -> print x >> return vm
         _ -> err "PRT expected an argument"
 
 prtS :: String -> Program' IO a
 prtS s = program (PRTS s) $
   const $ \vm -> print s >> return vm
 
+
 fork :: Program' [] a -> Program' [] a -> Program' [] a
-fork br1 br2 p m = program (FORK (toCode br1) (toCode br2)) (const go) Nothing m
-  where go = run (br1 p m) <> run (br2 p m)
+fork br1 br2 logger mem = program (FORK (toCode br1) (toCode br2)) (const go) Nothing mem
+  where go = run (br1 logger mem) <> run (br2 logger mem)
 
 geti :: PrimMonad m => Int -> Program' m a
 {-# INLINE geti #-}
 geti i = programM (GETI i) $
-  \m -> \s -> \vm -> do x <- M.unsafeRead m i
-                        setStack (x:s) vm
+  \mem -> \s -> if (0 <= i && i < memSize)
+                then \vm -> do x <- M.unsafeRead mem i
+                               setStack (x:s) vm
+                else err "GETI got index out of range"
 
 puti :: PrimMonad m => Int -> Program' m a
 {-# INLINE puti #-}
 puti i = programM (PUTI i) $
-  \m -> \case (x:s) -> \vm -> M.unsafeWrite m i x >> setStack s vm
-              _ -> err "expected an element"
+  \mem -> \case (x:s) -> if (0 <= i && i < memSize)
+                         then \vm -> M.unsafeWrite mem i x >> setStack s vm
+                         else err "PUTI got index out of range"
+                _ -> err "PUTI expected an element"
 
 get :: PrimMonad m => Program' m a
 {-# INLINE get #-}
 get = programM (GET) $
-  \m -> \case (i:s) -> \vm -> do x <- M.read m i
-                                 setStack (x:s) vm
-              _ -> err "expected an element"
+  \mem -> \case (i:s) -> \vm -> do x <- M.read mem i
+                                   setStack (x:s) vm
+                _ -> err "GET expected an element"
 
 put :: PrimMonad m => Program' m a
 {-# INLINE put #-}
 put = programM (PUT) $
-  \m -> \case (i:x:s) -> \vm -> M.write m i x >> setStack s vm
-              _ -> err "expected two elemets"
+  \mem -> \case (i:x:s) -> \vm -> M.write mem i x >> setStack s vm
+                _ -> err "PUT expected two elemets"
 
 ------------------------------------------------------------
 
@@ -368,8 +385,7 @@ listing = unlines . printCode 0 . toCode
           c -> output $ show c
 
         output x = [stimes n "  " ++ x]
-        indent = printCode (n+1)
-
+        indent = printCode (n+1)        
 
 ------------------------------------------------------------
 -- Example programs
@@ -432,16 +448,38 @@ test = stimes 100 $
   dup <> fact3 <> swap <>
   push 54 <> gcd1 <> pow <> gcd1 <> eq <> pop
 
-fill :: Program' IO a
-fill = dup <> dup <> puti 0 <>
-       while (dup <> push memSize <> geti 0 <> sub <> lt)
-       (geti 0 <> add <> push 1 <> exch <> put) <>
+fill :: PrimMonad m => Program' m a
+fill = dup <> dup <> add <>
+       while (dup <> push memSize <> lt)
+       (dup <> push 1 <> swap <> put <> exch <> add) <>
        pop
 
-sieve :: Program' IO a
+sieve :: PrimMonad m => Program' m a
 sieve = push 2 <>
         while (dup <> dup <> mul <> push memSize <> lt)
-        (dup <> get <> branch mempty fill <> inc) 
+        (dup <> get <> branch mempty fill <> inc) <>
+        pop
 
-main = print =<< journal <$> execLog logSteps 0 (stimes 100 sieve <> prtS "Ok")
--- main = execM (stimes 100 sieve <> prtS "Ok")
+--main = print =<< journal <$> execLog (logSteps &&& logStackUsed) (stimes 10 sieve <> prtS "Ok")
+--main = execM (stimes 100 sieve <> prtS "Ok")
+
+fill' :: Int -> Int -> Memory IO -> IO (Memory IO)
+fill' k n m
+  | n > memSize-k = return m
+  | otherwise = M.unsafeWrite m n 1 >> fill' k (n+k) m
+
+sieve' :: Int -> Memory IO -> IO (Memory IO)
+sieve' k m
+  | k*k < memSize =
+      do x <- M.unsafeRead m k
+         if x == 0
+           then fill' k (2*k) m >>= sieve' (k+1)
+           else sieve' (k+1) m
+  | otherwise = return m
+  
+mtimes n = mconcat . replicate n
+
+main = do m <- M.replicate memSize 0
+          mtimes 100 (sieve' 2 m >> return ())
+          print "Ok" 
+
